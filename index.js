@@ -13,11 +13,19 @@ app.use(express.json({ limit: "2mb" }));
  */
 const {
   NODE_ENV = "development",
+
+  // Security
   BRAIN_SECRET,
+
+  // Airtable
   AIRTABLE_API_KEY,
   AIRTABLE_BASE_ID,
   AIRTABLE_TABLE_NAME = "Leads",
   AIRTABLE_TIMEOUT_MS = "12000",
+
+  // Optional gates (leave unset unless you want them)
+  REQUIRE_CA = "false",
+  REQUIRE_KERN = "false",
 } = process.env;
 
 const AIRTABLE_TIMEOUT = Number(AIRTABLE_TIMEOUT_MS) || 12000;
@@ -47,23 +55,20 @@ function lower(v) {
   return toStr(v).toLowerCase();
 }
 
+function truthy(v) {
+  const s = lower(v);
+  return s === "true" || s === "yes" || s === "1" || s === "y" || s === "checked" || s === "on";
+}
+
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
 function normalizePhone(phone) {
   const digits = toStr(phone).replace(/\D/g, "");
   if (!digits) return "";
   // Keep last 10 digits for US-style matching (prevents +1 vs no +1 mismatch)
   return digits.length > 10 ? digits.slice(-10) : digits;
-}
-
-function normalizeAddress(addr) {
-  return lower(addr)
-    .replace(/\s+/g, " ")
-    .replace(/[.,#]/g, "")
-    .trim();
-}
-
-function truthy(v) {
-  const s = lower(v);
-  return s === "true" || s === "yes" || s === "1" || s === "y" || s === "checked" || s === "on";
 }
 
 function escapeAirtableString(s) {
@@ -74,6 +79,21 @@ function abortableTimeout(ms) {
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(), ms);
   return { ctrl, id };
+}
+
+function pick(obj, keys) {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (v !== undefined && v !== null && toStr(v) !== "") return v;
+  }
+  return undefined;
+}
+
+function yn(v) {
+  const s = lower(v);
+  if (["yes", "y", "true", "1", "checked", "on"].includes(s)) return "yes";
+  if (["no", "n", "false", "0", "off"].includes(s)) return "no";
+  return "unknown";
 }
 
 /**
@@ -89,6 +109,7 @@ function requireSecret(req, res, next) {
     if (NODE_ENV === "production") {
       return res.status(500).json({ ok: false, error: "Server misconfigured (missing BRAIN_SECRET)" });
     }
+    // In dev, allow through if secret isn't set
     return next();
   }
 
@@ -101,34 +122,77 @@ function requireSecret(req, res, next) {
 
 /**
  * =========================
- * SCORING (Marshall-style)
+ * CONSENT
  * =========================
- * Inputs expected (from Tally/Make):
- * - Owns property?
- * - Avg monthly bill
- * - Roof age (years)
- * - Sun exposure
- * - HOA?
- * - Annual true-up cost / high true-up bills (yes/no or numeric)
- * - Property type
- * - What matters most
- * - Approach to home improvement
- *
- * Output:
- * - Score (0-100ish)
- * - Tier (single-select friendly)
- * - Lead temperature
- * - Reject reasons (if any)
- * - Score reasons (human-readable)
+ * Accepts:
+ * - boolean true/false
+ * - "yes"/"no"
+ * - "checked"/"on"
+ */
+function extractConsentFlags(lead) {
+  const emailConsent =
+    lead.opt_in_email ??
+    lead["Opt-in email?"] ??
+    lead["Email consent checkbox"] ??
+    lead.email_consent;
+
+  const smsConsent =
+    lead.opt_in_sms ??
+    lead["Opt-in SMS?"] ??
+    lead["SMS consent checkbox"] ??
+    lead.sms_consent;
+
+  return {
+    opt_in_email: truthy(emailConsent),
+    opt_in_sms: truthy(smsConsent),
+  };
+}
+
+/**
+ * =========================
+ * SCORING (Marshall-style) — Finalized
+ * =========================
+ * Output keys are stable for Make:
+ * - score (0-100)
+ * - tier (Airtable single select string)
+ * - lead_temperature (Hot/Warm/Cold)
+ * - reject_reasons (array)
+ * - score_reasons (string)
+ * - marshall_eligible (boolean)
  */
 function scoreLead(lead) {
   const reasons = [];
   const rejectReasons = [];
 
-  const owns = lower(lead["Owns property?"] ?? lead.owns_property ?? lead.owns ?? lead.own);
-  const isOwner = owns.includes("yes") || owns.includes("true") || owns === "1" || owns.includes("own");
+  // Optional geo gates (only enforced when data present)
+  const requireCA = truthy(REQUIRE_CA);
+  const requireKern = truthy(REQUIRE_KERN);
 
-  // Hard gate: must be owner (you said this is key)
+  const state = toStr(pick(lead, ["State", "state"])).toUpperCase();
+  const county = lower(pick(lead, ["County", "county"]));
+
+  if (requireCA && state && state !== "CA" && state !== "CALIFORNIA") {
+    rejectReasons.push("Outside California");
+  }
+  if (requireKern && county && !county.includes("kern")) {
+    rejectReasons.push("Outside Kern County");
+  }
+  if (rejectReasons.length) {
+    return {
+      score: 0,
+      tier: "Disqualified",
+      lead_temperature: "Cold",
+      reject_reasons: rejectReasons,
+      score_reasons: rejectReasons.join(" | "),
+      marshall_eligible: false
+    };
+  }
+
+  // Ownership (hard gate: must be homeowner)
+  const ownsRaw = pick(lead, ["Owns property?", "owns_property", "owns", "own", "homeowner"]);
+  const owns = yn(ownsRaw);
+  const isOwner = owns === "yes";
+
   if (!isOwner) {
     rejectReasons.push("Not homeowner");
     return {
@@ -139,87 +203,88 @@ function scoreLead(lead) {
       score_reasons: "Not homeowner",
       marshall_eligible: false
     };
-  } else {
-    reasons.push("Homeowner");
   }
+  reasons.push("Homeowner");
 
-  let score = 30; // owner base
+  // Start from neutral base (prevents missing fields from auto-failing)
+  let score = 50;
 
   // Avg monthly bill
-  const billRaw = toStr(lead["Avg monthly bill"] ?? lead.avg_monthly_bill ?? lead.bill);
+  const billRaw = toStr(pick(lead, ["Avg monthly bill", "avg_monthly_bill", "bill"]));
   const billNum = Number(billRaw.replace(/[^0-9.]/g, ""));
   if (!Number.isNaN(billNum) && billNum > 0) {
-    if (billNum >= 250) { score += 25; reasons.push("High bill"); }
-    else if (billNum >= 150) { score += 15; reasons.push("Mid bill"); }
-    else { score += 5; reasons.push("Low bill"); }
+    if (billNum >= 250) { score += 18; reasons.push("High bill"); }
+    else if (billNum >= 150) { score += 10; reasons.push("Mid bill"); }
+    else { score += 2; reasons.push("Low bill"); }
   } else {
-    // If bill is a single select string like "$150-$250", match loosely
-    const billTxt = lower(billRaw);
-    if (billTxt.includes("250")) { score += 25; reasons.push("High bill"); }
-    else if (billTxt.includes("150")) { score += 15; reasons.push("Mid bill"); }
-    else if (billTxt) { score += 8; reasons.push("Bill provided"); }
-    else { score += 0; reasons.push("Bill unknown"); }
+    const b = lower(billRaw);
+    if (b.includes("250")) { score += 18; reasons.push("High bill"); }
+    else if (b.includes("150")) { score += 10; reasons.push("Mid bill"); }
+    else if (b) { score += 4; reasons.push("Bill provided"); }
+    else { reasons.push("Bill unknown"); }
   }
 
-  // Roof age
-  const roofAgeRaw = toStr(lead["Roof age (years)"] ?? lead.roof_age_years ?? lead.roof_age);
+  // Roof age (years)
+  const roofAgeRaw = toStr(pick(lead, ["Roof age (years)", "roof_age_years", "roof_age"]));
   const roofAgeNum = Number(roofAgeRaw.replace(/[^0-9.]/g, ""));
   if (!Number.isNaN(roofAgeNum) && roofAgeNum > 0) {
-    if (roofAgeNum <= 10) { score += 20; reasons.push("Roof <= 10 years"); }
-    else if (roofAgeNum <= 20) { score += 10; reasons.push("Roof 10–20 years"); }
-    else { score += 0; reasons.push("Roof > 20 years"); }
+    if (roofAgeNum <= 10) { score += 12; reasons.push("Roof <= 10 years"); }
+    else if (roofAgeNum <= 20) { score += 6; reasons.push("Roof 10–20 years"); }
+    else { reasons.push("Roof > 20 years"); }
   } else {
     const r = lower(roofAgeRaw);
-    if (r.includes("under") || r.includes("<") || r.includes("10")) { score += 20; reasons.push("Roof likely good"); }
-    else if (r.includes("20")) { score += 10; reasons.push("Roof maybe"); }
-    else { score += 0; reasons.push("Roof unknown"); }
+    if (r.includes("under") || r.includes("<") || r.includes("10")) { score += 12; reasons.push("Roof likely good"); }
+    else if (r.includes("20")) { score += 6; reasons.push("Roof maybe"); }
+    else { reasons.push("Roof unknown"); }
   }
 
   // Sun exposure
-  const sun = lower(lead["Sun exposure"] ?? lead.sun_exposure ?? "");
+  const sun = lower(pick(lead, ["Sun exposure", "sun_exposure"]));
   if (sun.includes("full") || sun.includes("great") || sun.includes("high")) {
-    score += 15; reasons.push("Good sun exposure");
+    score += 10; reasons.push("Good sun exposure");
   } else if (sun.includes("partial") || sun.includes("medium")) {
-    score += 8; reasons.push("Medium sun exposure");
+    score += 5; reasons.push("Medium sun exposure");
   } else if (sun) {
-    score += 2; reasons.push("Low/unknown sun exposure");
+    reasons.push("Low/unknown sun exposure");
+  } else {
+    reasons.push("Sun exposure unknown");
   }
 
-  // HOA (not a hard reject, but friction)
-  const hoa = lower(lead["HOA?"] ?? lead.hoa ?? "");
-  if (hoa.includes("yes") || hoa.includes("true")) {
-    score -= 5; reasons.push("HOA friction");
-  } else if (hoa.includes("no") || hoa.includes("false")) {
-    reasons.push("No HOA");
-  }
+  // HOA friction
+  const hoaRaw = pick(lead, ["HOA?", "hoa", "has_hoa"]);
+  const hoa = yn(hoaRaw);
+  if (hoa === "yes") { score -= 8; reasons.push("HOA friction"); }
+  else if (hoa === "no") { score += 4; reasons.push("No HOA"); }
+  else { score -= 2; reasons.push("HOA unknown"); }
 
-  // True-up bills (optional positive indicator of value)
-  const trueUpRaw = toStr(lead["Annual true-up cost"] ?? lead.true_up ?? lead.trueup ?? "");
-  const trueUpTxt = lower(trueUpRaw);
+  // True-up bills (optional)
+  const trueUpRaw = toStr(pick(lead, ["Annual true-up cost", "true_up", "trueup"]));
   const trueUpNum = Number(trueUpRaw.replace(/[^0-9.]/g, ""));
-  if (!Number.isNaN(trueUpNum) && trueUpNum >= 500) {
-    score += 8; reasons.push("High true-up cost");
+  const trueUpTxt = lower(trueUpRaw);
+
+  if (!Number.isNaN(trueUpNum) && trueUpNum > 0) {
+    if (trueUpNum >= 500) { score += 6; reasons.push("High true-up cost"); }
+    else { score += 2; reasons.push("True-up cost indicated"); }
   } else if (trueUpTxt.includes("yes") || trueUpTxt.includes("true")) {
-    score += 6; reasons.push("True-up indicated");
+    score += 4; reasons.push("True-up indicated");
   }
 
-  // Property type (single family tends to be easier)
-  const ptype = lower(lead["Property type"] ?? lead.property_type ?? "");
-  if (ptype.includes("single")) { score += 5; reasons.push("Single family"); }
-  else if (ptype.includes("mobile") || ptype.includes("manufact")) { score -= 5; reasons.push("Mobile/manufactured complexity"); }
+  // Property type
+  const ptype = lower(pick(lead, ["Property type", "property_type"]));
+  if (ptype.includes("single")) { score += 4; reasons.push("Single family"); }
+  else if (ptype.includes("mobile") || ptype.includes("manufact")) { score -= 6; reasons.push("Mobile/manufactured complexity"); }
   else if (ptype) { reasons.push("Property type noted"); }
 
-  // Clamp
-  if (score < 0) score = 0;
-  if (score > 100) score = 100;
+  // Clamp score
+  score = clamp(Math.round(score), 0, 100);
 
-  // Tiering
+  // Tiering (KEEP THESE STRINGS to match your Airtable single-select)
   let tier = "Warm – Review Later";
   let temp = "Warm";
   let eligible = false;
 
-  if (score >= 70) { tier = "Qualified – Send to Marshall"; temp = "Hot"; eligible = true; }
-  else if (score >= 40) { tier = "Warm – Review Later"; temp = "Warm"; }
+  if (score >= 75) { tier = "Qualified – Send to Marshall"; temp = "Hot"; eligible = true; }
+  else if (score >= 55) { tier = "Warm – Review Later"; temp = "Warm"; }
   else { tier = "Educational Only"; temp = "Cold"; }
 
   return {
@@ -249,7 +314,6 @@ function airtableHeaders() {
 }
 
 function airtableUrl(path) {
-  // Table name must be URL-encoded
   return `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(AIRTABLE_TABLE_NAME)}${path}`;
 }
 
@@ -322,26 +386,23 @@ async function airtableUpdate(recordId, fields) {
  * =========================
  * FIELD MAPPING (Tally/Make -> Airtable Leads table)
  * =========================
- *
- * You said: "Tally answers are same single selects as airtable"
- * So we write them directly into your existing columns.
  */
 function buildAirtableFieldsFromLead(lead, scored, consentFlags, meta) {
-  // Consent flags
   const optInEmail = consentFlags.opt_in_email;
   const optInSms = consentFlags.opt_in_sms;
   const outreachAllowed = optInEmail || optInSms;
-
-  // If no opt-in, we mark Do not contact TRUE (safe default)
   const doNotContact = !outreachAllowed;
 
-  // Use Tally provided fields if present
+  // Identity
   const name = toStr(lead.name ?? lead["Lead name"] ?? lead["What is your name"]);
   const email = toStr(lead.email ?? lead["Email"] ?? lead["What is your best email"]);
   const phoneRaw = toStr(lead.phone ?? lead["Phone"] ?? lead["What is your best phone number"]);
-  const phone = normalizePhone(phoneRaw) ? phoneRaw : phoneRaw; // store original; dedupe uses normalized separately
 
-  const address = toStr(lead.address ?? lead["Address"] ?? lead["What is your property address you’re asking in regards to?"]);
+  const address = toStr(
+    lead.address ??
+    lead["Address"] ??
+    lead["What is your property address you’re asking in regards to?"]
+  );
   const city = toStr(lead.city ?? lead["City"]);
   const state = toStr(lead.state ?? lead["State"]);
   const zip = toStr(lead.zip ?? lead["Zip"] ?? lead["Zip/postal code"] ?? lead["Zip/postal code "]);
@@ -362,7 +423,7 @@ function buildAirtableFieldsFromLead(lead, scored, consentFlags, meta) {
   const whatMattersMost = toStr(lead.what_matters_most ?? lead["What matters most"] ?? lead["What matters MOST to you in a solar investment?"]);
   const approach = toStr(lead.approach ?? lead["Approach to home improvement"] ?? lead["Your approach to major home improvements"]);
 
-  // Make/Tally meta
+  // Meta
   const leadSource = toStr(lead.lead_source ?? lead["Lead source"] ?? meta.source_name ?? "Tally");
 
   return {
@@ -393,7 +454,7 @@ function buildAirtableFieldsFromLead(lead, scored, consentFlags, meta) {
     "Lead temperature": scored.lead_temperature,
     "Score reasons": scored.score_reasons,
     "Reject reasons": (scored.reject_reasons || []).join(" | "),
-    "AI tier": scored.tier,                 // keep same unless you want separate taxonomy
+    "AI tier": scored.tier,
     "Needs scoring": false,
 
     // Outreach controls
@@ -405,32 +466,6 @@ function buildAirtableFieldsFromLead(lead, scored, consentFlags, meta) {
     // Ops meta
     "Lead source": leadSource,
     "Internal notes": `[trace:${meta.trace_id}] Scored at ${nowIso()}`
-  };
-}
-
-/**
- * Extract consent from incoming payload.
- * We accept:
- * - boolean true/false
- * - "yes"/"no"
- * - "checked"/"on"
- */
-function extractConsentFlags(lead) {
-  const emailConsent =
-    lead.opt_in_email ??
-    lead["Opt-in email?"] ??
-    lead["Email consent checkbox"] ??
-    lead.email_consent;
-
-  const smsConsent =
-    lead.opt_in_sms ??
-    lead["Opt-in SMS?"] ??
-    lead["SMS consent checkbox"] ??
-    lead.sms_consent;
-
-  return {
-    opt_in_email: truthy(emailConsent),
-    opt_in_sms: truthy(smsConsent),
   };
 }
 
@@ -448,7 +483,6 @@ async function upsertLeadToAirtable(lead, scored, meta) {
   const consentFlags = extractConsentFlags(lead);
   const fields = buildAirtableFieldsFromLead(lead, scored, consentFlags, meta);
 
-  // Find existing
   const existing = await airtableFindExisting({
     phone: phoneNorm ? phoneNorm : "",
     email,
@@ -494,10 +528,11 @@ app.post("/score", requireSecret, (req, res) => {
   res.json({ ok: true, trace_id: t, scored, consent, routing });
 });
 
-// Score + Upsert to Airtable (this is what Make should call)
+// Score + Upsert to Airtable (Make should call this)
 app.post("/ingest", requireSecret, async (req, res) => {
   const t = traceId();
   const lead = req.body?.lead ?? req.body ?? {};
+
   const meta = {
     trace_id: t,
     source_name: toStr(req.body?.meta?.source_name ?? "Make/Tally"),
